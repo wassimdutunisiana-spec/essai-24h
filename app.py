@@ -46,6 +46,7 @@ PAGE = """<!doctype html>
 <div class="box">
  <p><b>Identifiant :</b> {{ creds.username }}</p>
  <p><b>Mot de passe :</b> {{ creds.password }}</p>
+ {% if creds.url %}<p><b>Lien :</b> {{ creds.url }}</p>{% endif %}
  {% if creds.expires %}<p><b>Expire le :</b> {{ creds.expires }}</p>{% endif %}
  <p>Notez-les maintenant : ils ne seront pas réaffichés.</p>
 </div>
@@ -61,6 +62,24 @@ def client_ip():
 def rand_string(n):
     alphabet = string.ascii_lowercase + string.digits
     return "".join(secrets.choice(alphabet) for _ in range(n))
+
+
+def find_value(obj, names):
+    """Cherche (même dans des sous-objets) la première clé correspondant à `names`."""
+    if isinstance(obj, dict):
+        for key, val in obj.items():
+            if key.lower() in names and isinstance(val, (str, int)) and str(val).strip():
+                return str(val)
+        for val in obj.values():
+            found = find_value(val, names)
+            if found:
+                return found
+    elif isinstance(obj, list):
+        for item in obj:
+            found = find_value(item, names)
+            if found:
+                return found
+    return None
 
 
 def create_trial():
@@ -84,8 +103,20 @@ def create_trial():
     if not data.get("success"):
         print("Erreur API :", r.status_code, data.get("message"))  # visible dans les logs Render
         return None, "Service momentanément indisponible."
-    expires = (data.get("data") or {}).get("expires_at")
-    return {"username": username, "password": password, "expires": expires}, None
+    payload = data.get("data") or data
+    print("Réponse du panel :", payload)  # visible dans les logs Render (ne contient pas le token)
+    real_user = find_value(payload, {"username", "user", "login"})
+    real_pass = find_value(payload, {"password", "pass", "pwd"})
+    if not real_user or not real_pass:
+        print("Identifiants introuvables dans la réponse du panel.")
+        return None, "Compte créé, mais les identifiants n'ont pas pu être récupérés. Contactez le support."
+    creds = {
+        "username": real_user,
+        "password": real_pass,
+        "url": find_value(payload, {"m3u", "m3u_url", "url", "link", "playlist"}),
+        "expires": find_value(payload, {"expires_at", "expiry", "exp_date", "expire", "expires"}),
+    }
+    return creds, None
 
 
 @app.route("/", methods=["GET", "POST"])
