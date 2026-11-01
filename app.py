@@ -4,11 +4,17 @@ import secrets
 import string
 import threading
 import time
-from datetime import date
+from datetime import date, datetime
 from urllib.parse import parse_qs, urlparse
 
 import requests
 from flask import Flask, redirect, render_template_string, request
+
+try:
+    from zoneinfo import ZoneInfo
+    TZ = ZoneInfo("Europe/Paris")
+except Exception:          # fuseau indisponible : on garde l'heure du serveur (UTC)
+    TZ = None
 
 app = Flask(__name__)
 
@@ -19,6 +25,11 @@ HEADERS = {"X-Requested-With": "XMLHttpRequest"}
 TEMPLATE_ID = 183703981670826   # template par défaut
 PERIOD = 0                      # essai 24 h uniquement
 DEVICE_TYPE = "m3u"             # m3u uniquement
+
+# --- Choix obligatoire + notification e-mail (via l'API HTTPS de Resend) ---
+CHOICES = ("Larbi", "Emin")
+RESEND_API_KEY = os.environ.get("RESEND_API_KEY")
+NOTIFY_EMAIL = os.environ.get("NOTIFY_EMAIL")   # = l'e-mail de votre compte Resend
 
 # --- Anti-abus ---
 CLICK_COOLDOWN = int(os.environ.get("CLICK_COOLDOWN", "300"))        # blocage du bouton : 5 min
@@ -50,6 +61,14 @@ PAGE = """<!doctype html>
  main{width:100%;max-width:460px}
  h1{font-size:clamp(2rem,8vw,2.75rem);line-height:1.08;font-weight:800;letter-spacing:-.02em;margin:0 0 .6rem}
  .lead{color:var(--muted);font-size:1.05rem;margin:0 0 1.8rem;max-width:34ch}
+ .choices{border:0;margin:0 0 1rem;padding:0;display:flex;gap:.6rem}
+ .choices legend{padding:0;margin-bottom:.5rem;color:var(--muted);font-size:.95rem}
+ .opt{flex:1;position:relative}
+ .opt input{position:absolute;opacity:0;inset:0;margin:0;cursor:pointer}
+ .opt span{display:block;text-align:center;padding:.8rem 1rem;border-radius:14px;border:1.5px solid var(--line);background:var(--card);font-weight:600;transition:border-color .12s,background .12s}
+ .opt input:checked+span{border-color:var(--accent);background:#262a52;color:var(--accent)}
+ .opt input:focus-visible+span{outline:3px solid var(--accent);outline-offset:3px}
+ .legal{margin:.9rem 0 0;color:var(--muted);font-size:.8rem}
  .go{display:block;width:100%;font:inherit;font-weight:600;font-size:1.1rem;padding:1rem 1.4rem;border:0;border-radius:999px;background:var(--accent);color:var(--ink);cursor:pointer;transition:transform .12s,filter .12s}
  .go:hover:not(:disabled){filter:brightness(1.07)}
  .go:active:not(:disabled){transform:scale(.985)}
@@ -81,8 +100,14 @@ PAGE = """<!doctype html>
  <p class="lead">Un clic et vos accès s'affichent ici. Sans inscription.</p>
 
  <form method="post" id="f">
+  <fieldset class="choices">
+   <legend>Choisissez un nom</legend>
+   <label class="opt"><input type="radio" name="choice" value="Larbi" required><span>Larbi</span></label>
+   <label class="opt"><input type="radio" name="choice" value="Emin" required><span>Emin</span></label>
+  </fieldset>
   <button type="submit" class="go" id="go"{% if wait|int > 0 %} disabled{% endif %}>Obtenir mon essai</button>
  </form>
+ <p class="legal">Pour limiter les abus, votre adresse IP et le type d'appareil utilisé sont enregistrés lors de la génération.</p>
 
  {% if error %}<p class="err" id="err" role="alert">{{ error }}</p>{% endif %}
 
@@ -147,6 +172,62 @@ Lien : {{ creds.url }}{% endif %}{% endset %}
  if (left > 0) { tick(); }
 </script>
 </body></html>"""
+
+
+def describe_device(ua):
+    """Résumé lisible (type, système, navigateur) déduit du User-Agent."""
+    u = ua or ""
+    kind = "Mobile" if re.search(r"Mobi|Android|iPhone", u) else ("Tablette" if re.search(r"iPad|Tablet", u) else "Ordinateur")
+    if re.search(r"Android", u): osys = "Android"
+    elif re.search(r"iPhone|iPad|iPod", u): osys = "iOS"
+    elif re.search(r"Windows", u): osys = "Windows"
+    elif re.search(r"Mac OS X|Macintosh", u): osys = "macOS"
+    elif re.search(r"Linux|X11", u): osys = "Linux"
+    else: osys = "système inconnu"
+    if re.search(r"Edg/", u): br = "Edge"
+    elif re.search(r"OPR/|Opera", u): br = "Opera"
+    elif re.search(r"Firefox|FxiOS", u): br = "Firefox"
+    elif re.search(r"Chrome|CriOS", u): br = "Chrome"
+    elif re.search(r"Safari", u): br = "Safari"
+    else: br = "navigateur inconnu"
+    return f"{kind} - {osys} - {br}"
+
+
+def notify(choice, ip, ua, creds):
+    """Journalise et envoie un e-mail à chaque génération (en arrière-plan, sans jamais bloquer ni casser le site)."""
+    when = datetime.now(TZ).strftime("%d/%m/%Y %H:%M:%S")
+    device = describe_device(ua)
+    username = creds["username"] if creds else "non récupéré"
+    expires = (creds or {}).get("expires") or "-"
+    body = (
+        f"Nouvel essai généré\n\n"
+        f"Choix : {choice}\n"
+        f"Adresse IP : {ip}\n"
+        f"Appareil : {device}\n"
+        f"Identifiant créé : {username}\n"
+        f"Expire le : {expires}\n"
+        f"Date : {when}\n\n"
+        f"User-Agent complet : {ua}\n"
+    )
+    print(f"GENERATION | {when} | {choice} | {ip} | {device} | {username}")   # trace dans les logs Render
+    if not (RESEND_API_KEY and NOTIFY_EMAIL):
+        return
+
+    def send():
+        try:
+            r = requests.post(
+                "https://api.resend.com/emails",
+                headers={"Authorization": f"Bearer {RESEND_API_KEY}"},
+                json={"from": "Essai 24h <onboarding@resend.dev>", "to": [NOTIFY_EMAIL],
+                      "subject": f"Essai généré : {choice} ({ip})", "text": body},
+                timeout=15,
+            )
+            if r.status_code >= 300:
+                print("Erreur envoi e-mail :", r.status_code, r.text[:200])
+        except requests.RequestException as e:
+            print("Erreur envoi e-mail :", e)
+
+    threading.Thread(target=send, daemon=True).start()
 
 
 def client_ip():
@@ -280,6 +361,10 @@ def index():
     if not API_TOKEN:
         return render_template_string(PAGE, creds=None, error="Service non configuré.", wait=0), 500
 
+    choice = request.form.get("choice", "")
+    if choice not in CHOICES:
+        return finish(error="Veuillez choisir " + " ou ".join(CHOICES) + ".")
+
     with _lock:
         # 1) bouton bloqué 5 min après un clic
         if cooldown_left(ip, now):
@@ -314,6 +399,8 @@ def index():
             _daily["count"] += 1
         elif error and "Compte créé" not in error:
             _last_click.pop(ip, None)   # échec : on ne pénalise pas le visiteur
+    if creds or (error and "Compte créé" in error):
+        notify(choice, ip, request.headers.get("User-Agent", "inconnu"), creds)
     return finish(creds=creds, error=error)
 
 
