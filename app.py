@@ -19,11 +19,12 @@ PERIOD = 0                      # essai 24 h uniquement
 DEVICE_TYPE = "m3u"             # m3u uniquement
 
 # --- Anti-abus ---
-COOLDOWN_SECONDS = 24 * 3600                              # 1 essai par IP / 24 h
+WINDOW_SECONDS = 24 * 3600                                # fenêtre glissante de 24 h
+MAX_TRIALS_PER_IP = int(os.environ.get("MAX_TRIALS_PER_IP", "5"))     # essais max par IP / 24 h
 MAX_TRIALS_PER_DAY = int(os.environ.get("MAX_TRIALS_PER_DAY", "50"))  # plafond global
 
 _lock = threading.Lock()
-_last_trial = {}               # ip -> timestamp
+_trials = {}                   # ip -> liste des timestamps des essais créés
 _daily = {"day": date.today(), "count": 0}
 
 PAGE = """<!doctype html>
@@ -102,9 +103,11 @@ def index():
         if _daily["count"] >= MAX_TRIALS_PER_DAY:
             return render_template_string(PAGE, creds=None,
                 error="Le quota d'essais du jour est atteint, revenez demain."), 429
-        if now - _last_trial.get(ip, 0) < COOLDOWN_SECONDS:
+        recent = [t for t in _trials.get(ip, []) if now - t < WINDOW_SECONDS]
+        _trials[ip] = recent
+        if len(recent) >= MAX_TRIALS_PER_IP:
             return render_template_string(PAGE, creds=None,
-                error="Un essai a déjà été généré depuis votre connexion aujourd'hui."), 429
+                error=f"Limite de {MAX_TRIALS_PER_IP} essais par 24 h atteinte depuis votre connexion."), 429
 
     try:
         creds, error = create_trial()
@@ -114,7 +117,7 @@ def index():
 
     if creds:
         with _lock:
-            _last_trial[ip] = now
+            _trials.setdefault(ip, []).append(now)
             _daily["count"] += 1
     return render_template_string(PAGE, creds=creds, error=error)
 
