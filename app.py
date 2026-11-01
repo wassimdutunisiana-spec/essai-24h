@@ -8,7 +8,7 @@ from datetime import date
 from urllib.parse import parse_qs, urlparse
 
 import requests
-from flask import Flask, render_template_string, request
+from flask import Flask, redirect, render_template_string, request
 
 app = Flask(__name__)
 
@@ -24,9 +24,11 @@ DEVICE_TYPE = "m3u"             # m3u uniquement
 CLICK_COOLDOWN = int(os.environ.get("CLICK_COOLDOWN", "300"))        # blocage du bouton : 5 min
 WINDOW_SECONDS = 24 * 3600                                # fenêtre glissante de 24 h
 MAX_TRIALS_PER_IP = int(os.environ.get("MAX_TRIALS_PER_IP", "5"))     # essais max par IP / 24 h
+RESULT_TTL = 600                                          # un résultat reste consultable 10 min
 MAX_TRIALS_PER_DAY = int(os.environ.get("MAX_TRIALS_PER_DAY", "50"))  # plafond global
 
 _lock = threading.Lock()
+_results = {}                  # jeton -> (creds, erreur, expiration) : résultat affiché après redirection
 _last_click = {}               # ip -> timestamp du dernier clic pris en compte
 _trials = {}                   # ip -> liste des timestamps des essais créés
 _daily = {"day": date.today(), "count": 0}
@@ -91,7 +93,7 @@ Mot de passe : {{ creds.password }}{% if creds.url %}
 Lien : {{ creds.url }}{% endif %}{% endset %}
  <section class="pass" aria-label="Vos accès">
   <h2>Vos accès</h2>
-  <p class="note">Notez-les maintenant : ils ne seront pas réaffichés.</p>
+  <p class="note">Notez-les maintenant : cette page ne les affichera que quelques minutes.</p>
   {% if creds.server %}
   <div class="row"><div><span class="lab">Serveur</span><span class="val">{{ creds.server }}</span></div><button type="button" class="cp" data-copy="{{ creds.server }}">Copier</button></div>
   {% endif %}
@@ -245,39 +247,60 @@ def cooldown_left(ip, now):
     return max(0, int(CLICK_COOLDOWN - (now - _last_click.get(ip, 0)) + 0.999))
 
 
-def page(creds=None, error=None, wait=0, status=200):
-    return render_template_string(PAGE, creds=creds, error=error, wait=wait), status
+def finish(creds=None, error=None):
+    """Mémorise le résultat et redirige vers une simple page GET (Post/Redirect/Get).
+    Ainsi, recharger la page ou revenir en arrière ne renvoie JAMAIS le formulaire."""
+    now = time.time()
+    with _lock:
+        for k in [k for k, v in _results.items() if v[2] < now]:
+            del _results[k]
+        token = secrets.token_urlsafe(16)
+        _results[token] = (creds, error, now + RESULT_TTL)
+    return redirect(f"/?r={token}", code=303)
 
 
 @app.route("/", methods=["GET", "POST"])
 def index():
     ip, now = client_ip(), time.time()
 
+    # --- Consulter la page : n'a JAMAIS d'effet sur le panel ---
     if request.method == "GET":
         with _lock:
             wait = cooldown_left(ip, now)
-        return page(error=COOLDOWN_MSG if wait else None, wait=wait)
+            entry = _results.get(request.args.get("r", ""))
+            if entry and entry[2] < now:
+                entry = None
+        if entry:
+            creds, error, _ = entry
+        else:
+            creds, error = None, (COOLDOWN_MSG if wait else None)
+        return render_template_string(PAGE, creds=creds, error=error, wait=wait)
 
+    # --- Créer un essai : uniquement quand on clique sur le bouton (POST) ---
     if not API_TOKEN:
-        return page(error="Service non configuré.", status=500)
+        return render_template_string(PAGE, creds=None, error="Service non configuré.", wait=0), 500
 
     with _lock:
         # 1) bouton bloqué 5 min après un clic
-        wait = cooldown_left(ip, now)
-        if wait:
-            return page(error=COOLDOWN_MSG, wait=wait, status=429)
+        if cooldown_left(ip, now):
+            return redirect("/", code=303)
         # 2) plafond global journalier
         if _daily["day"] != date.today():
             _daily.update(day=date.today(), count=0)
         if _daily["count"] >= MAX_TRIALS_PER_DAY:
-            return page(error="Le quota d'essais du jour est atteint, revenez demain.", status=429)
-        # 3) limite par IP sur 24 h
-        recent = [t for t in _trials.get(ip, []) if now - t < WINDOW_SECONDS]
-        _trials[ip] = recent
-        if len(recent) >= MAX_TRIALS_PER_IP:
-            return page(error=f"Limite de {MAX_TRIALS_PER_IP} essais par 24 h atteinte depuis votre connexion.", status=429)
-        # on enregistre le clic tout de suite (évite les doubles clics simultanés)
-        _last_click[ip] = now
+            quota_error = "Le quota d'essais du jour est atteint, revenez demain."
+        else:
+            quota_error = None
+            # 3) limite par IP sur 24 h
+            recent = [t for t in _trials.get(ip, []) if now - t < WINDOW_SECONDS]
+            _trials[ip] = recent
+            if len(recent) >= MAX_TRIALS_PER_IP:
+                quota_error = f"Limite de {MAX_TRIALS_PER_IP} essais par 24 h atteinte depuis votre connexion."
+            else:
+                # on enregistre le clic tout de suite (évite les doubles clics simultanés)
+                _last_click[ip] = now
+    if quota_error:
+        return finish(error=quota_error)
 
     try:
         creds, error = create_trial()
@@ -291,7 +314,7 @@ def index():
             _daily["count"] += 1
         elif error and "Compte créé" not in error:
             _last_click.pop(ip, None)   # échec : on ne pénalise pas le visiteur
-    return page(creds=creds, error=error, wait=CLICK_COOLDOWN if creds else 0)
+    return finish(creds=creds, error=error)
 
 
 @app.route("/healthz")
