@@ -19,11 +19,13 @@ PERIOD = 0                      # essai 24 h uniquement
 DEVICE_TYPE = "m3u"             # m3u uniquement
 
 # --- Anti-abus ---
+CLICK_COOLDOWN = int(os.environ.get("CLICK_COOLDOWN", "300"))        # blocage du bouton : 5 min
 WINDOW_SECONDS = 24 * 3600                                # fenêtre glissante de 24 h
 MAX_TRIALS_PER_IP = int(os.environ.get("MAX_TRIALS_PER_IP", "5"))     # essais max par IP / 24 h
 MAX_TRIALS_PER_DAY = int(os.environ.get("MAX_TRIALS_PER_DAY", "50"))  # plafond global
 
 _lock = threading.Lock()
+_last_click = {}               # ip -> timestamp du dernier clic pris en compte
 _trials = {}                   # ip -> liste des timestamps des essais créés
 _daily = {"day": date.today(), "count": 0}
 
@@ -34,13 +36,14 @@ PAGE = """<!doctype html>
 <style>
  body{font-family:system-ui,sans-serif;max-width:480px;margin:10vh auto;padding:0 16px;text-align:center}
  button{font-size:1.1rem;padding:.8rem 1.6rem;border:0;border-radius:8px;background:#2563eb;color:#fff;cursor:pointer}
+ button:disabled{background:#9ca3af;cursor:not-allowed}
  .box{background:#f3f4f6;border-radius:8px;padding:1rem;margin-top:1.5rem;text-align:left;word-break:break-all}
  .err{color:#b91c1c;margin-top:1.5rem}
  @media (prefers-color-scheme: dark){body{background:#111;color:#eee}.box{background:#222}}
 </style></head><body>
 <h1>Essai gratuit 24 h</h1>
 <p>Obtenez vos identifiants de test en un clic.</p>
-<form method="post"><button type="submit">Obtenir mon essai</button></form>
+<form method="post"><button type="submit"{% if blocked %} disabled{% endif %}>Obtenir mon essai</button></form>
 {% if error %}<p class="err">{{ error }}</p>{% endif %}
 {% if creds %}
 <div class="box">
@@ -119,26 +122,44 @@ def create_trial():
     return creds, None
 
 
+COOLDOWN_MSG = "Code déjà généré, veuillez réessayer dans 5 minutes."
+
+
+def in_cooldown(ip, now):
+    return now - _last_click.get(ip, 0) < CLICK_COOLDOWN
+
+
 @app.route("/", methods=["GET", "POST"])
 def index():
+    ip, now = client_ip(), time.time()
+
     if request.method == "GET":
-        return render_template_string(PAGE, creds=None, error=None)
+        with _lock:
+            blocked = in_cooldown(ip, now)
+        return render_template_string(PAGE, creds=None, blocked=blocked,
+                                      error=COOLDOWN_MSG if blocked else None)
 
     if not API_TOKEN:
-        return render_template_string(PAGE, creds=None, error="Service non configuré."), 500
+        return render_template_string(PAGE, creds=None, blocked=False, error="Service non configuré."), 500
 
-    ip, now = client_ip(), time.time()
     with _lock:
+        # 1) bouton bloqué 5 min après un clic
+        if in_cooldown(ip, now):
+            return render_template_string(PAGE, creds=None, blocked=True, error=COOLDOWN_MSG), 429
+        # 2) plafond global journalier
         if _daily["day"] != date.today():
             _daily.update(day=date.today(), count=0)
         if _daily["count"] >= MAX_TRIALS_PER_DAY:
-            return render_template_string(PAGE, creds=None,
+            return render_template_string(PAGE, creds=None, blocked=False,
                 error="Le quota d'essais du jour est atteint, revenez demain."), 429
+        # 3) limite par IP sur 24 h
         recent = [t for t in _trials.get(ip, []) if now - t < WINDOW_SECONDS]
         _trials[ip] = recent
         if len(recent) >= MAX_TRIALS_PER_IP:
-            return render_template_string(PAGE, creds=None,
+            return render_template_string(PAGE, creds=None, blocked=False,
                 error=f"Limite de {MAX_TRIALS_PER_IP} essais par 24 h atteinte depuis votre connexion."), 429
+        # on enregistre le clic tout de suite (évite les doubles clics simultanés)
+        _last_click[ip] = now
 
     try:
         creds, error = create_trial()
@@ -146,11 +167,13 @@ def index():
         print("Erreur réseau :", e)
         creds, error = None, "Service momentanément indisponible."
 
-    if creds:
-        with _lock:
+    with _lock:
+        if creds:
             _trials.setdefault(ip, []).append(now)
             _daily["count"] += 1
-    return render_template_string(PAGE, creds=creds, error=error)
+        elif error and "Compte créé" not in error:
+            _last_click.pop(ip, None)   # échec : on ne pénalise pas le visiteur
+    return render_template_string(PAGE, creds=creds, error=error, blocked=bool(creds))
 
 
 @app.route("/healthz")
