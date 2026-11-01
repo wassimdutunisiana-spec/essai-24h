@@ -1,9 +1,11 @@
 import os
+import re
 import secrets
 import string
 import threading
 import time
 from datetime import date
+from urllib.parse import parse_qs, urlparse
 
 import requests
 from flask import Flask, render_template_string, request
@@ -47,6 +49,7 @@ PAGE = """<!doctype html>
 {% if error %}<p class="err">{{ error }}</p>{% endif %}
 {% if creds %}
 <div class="box">
+ {% if creds.server %}<p><b>Serveur :</b> {{ creds.server }}</p>{% endif %}
  <p><b>Identifiant :</b> {{ creds.username }}</p>
  <p><b>Mot de passe :</b> {{ creds.password }}</p>
  {% if creds.url %}<p><b>Lien :</b> {{ creds.url }}</p>{% endif %}
@@ -107,17 +110,42 @@ def create_trial():
         print("Erreur API :", r.status_code, data.get("message"))  # visible dans les logs Render
         return None, "Service momentanément indisponible."
     payload = data.get("data") or data
-    print("Réponse du panel :", payload)  # visible dans les logs Render (ne contient pas le token)
-    real_user = find_value(payload, {"username", "user", "login"})
-    real_pass = find_value(payload, {"password", "pass", "pwd"})
+    print("Réponse du panel reçue, clés :", list(payload) if isinstance(payload, dict) else type(payload))
+
+    m3u = find_value(payload, {"m3u_link", "m3u", "m3u_url", "url", "link", "playlist"})
+    server = real_user = real_pass = None
+
+    # 1) le plus fiable : lire le lien m3u (serveur, identifiant, mot de passe)
+    if m3u:
+        parsed = urlparse(m3u)
+        qs = parse_qs(parsed.query)
+        real_user = (qs.get("username") or [None])[0]
+        real_pass = (qs.get("password") or [None])[0]
+        if parsed.scheme and parsed.netloc:
+            server = f"{parsed.scheme}://{parsed.netloc}"
+
+    # 2) sinon : champs directs ou texte "xtream_details"
+    real_user = real_user or find_value(payload, {"username", "user", "login"})
+    real_pass = real_pass or find_value(payload, {"password", "pass", "pwd"})
+    if not (real_user and real_pass):
+        details = find_value(payload, {"xtream_details"}) or ""
+        mu = re.search(r"Username\*?\s*=\s*(\S+)", details)
+        mp = re.search(r"Password\*?\s*=\s*(\S+)", details)
+        ms = re.search(r"Server address\*?\s*=\s*(\S+)", details)
+        real_user = real_user or (mu.group(1) if mu else None)
+        real_pass = real_pass or (mp.group(1) if mp else None)
+        server = server or (ms.group(1) if ms else None)
+
     if not real_user or not real_pass:
         print("Identifiants introuvables dans la réponse du panel.")
         return None, "Compte créé, mais les identifiants n'ont pas pu être récupérés. Contactez le support."
+
     creds = {
+        "server": server,
         "username": real_user,
         "password": real_pass,
-        "url": find_value(payload, {"m3u", "m3u_url", "url", "link", "playlist"}),
-        "expires": find_value(payload, {"expires_at", "expiry", "exp_date", "expire", "expires"}),
+        "url": m3u,
+        "expires": find_value(payload, {"exp_date", "expires_at", "expiry", "expire", "expires"}),
     }
     return creds, None
 
