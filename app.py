@@ -36,13 +36,13 @@ CLICK_COOLDOWN = int(os.environ.get("CLICK_COOLDOWN", "300"))        # blocage d
 WINDOW_SECONDS = 24 * 3600                                # fenêtre glissante de 24 h
 MAX_TRIALS_PER_IP = int(os.environ.get("MAX_TRIALS_PER_IP", "5"))     # essais max par IP / 24 h
 RESULT_TTL = 600                                          # un résultat reste consultable 10 min
-MAX_TRIALS_PER_DAY = int(os.environ.get("MAX_TRIALS_PER_DAY", "50"))  # plafond global
+MAX_TRIALS_PER_DAY = 8                                    # plafond global : 8 codes par jour (heure de Paris)
 
 _lock = threading.Lock()
 _results = {}                  # jeton -> (creds, erreur, expiration) : résultat affiché après redirection
 _last_click = {}               # ip -> timestamp du dernier clic pris en compte
 _trials = {}                   # ip -> liste des timestamps des essais créés
-_daily = {"day": date.today(), "count": 0}
+_daily = {"day": None, "count": 0}
 
 PAGE = """<!doctype html>
 <html lang="fr"><head><meta charset="utf-8">
@@ -62,6 +62,7 @@ PAGE = """<!doctype html>
  h1{font-size:clamp(2rem,8vw,2.75rem);line-height:1.08;font-weight:800;letter-spacing:-.02em;margin:0 0 .6rem}
  .lead{color:var(--muted);font-size:1.05rem;margin:0 0 1.8rem;max-width:34ch}
  .choices{border:0;margin:0 0 1rem;padding:0;display:flex;gap:.6rem}
+ .choices[hidden]{display:none}
  .choices legend{padding:0;margin-bottom:.5rem;color:var(--muted);font-size:.95rem}
  .opt{flex:1;position:relative}
  .opt input{position:absolute;opacity:0;inset:0;margin:0;cursor:pointer}
@@ -76,6 +77,7 @@ PAGE = """<!doctype html>
  :focus-visible{outline:3px solid var(--accent);outline-offset:3px}
  .err{margin:1rem 0 0;color:var(--err);font-size:.98rem}
  .err[hidden]{display:none}
+ .closed{margin:1rem 0 0;padding:1rem;border-radius:14px;border:1.5px solid var(--err);color:var(--err);font-weight:800;font-size:1.25rem;text-align:center;letter-spacing:.02em}
  .pass{margin-top:2rem;background:var(--card);border:1px solid var(--line);border-radius:22px;overflow:hidden;animation:in .5s ease-out}
  .pass h2{margin:0;padding:1.2rem 1.3rem .4rem;font-size:1.25rem;font-weight:600}
  .note{margin:0;padding:0 1.3rem 1rem;color:var(--accent);font-size:.93rem}
@@ -100,16 +102,18 @@ PAGE = """<!doctype html>
  <p class="lead">Un clic et vos accès s'affichent ici. Sans inscription.</p>
 
  <form method="post" id="f">
-  <fieldset class="choices">
+  <fieldset class="choices" id="choices"{% if wait|int > 0 or closed %} hidden{% endif %}>
    <legend>Choisissez un nom</legend>
    <label class="opt"><input type="radio" name="choice" value="Larbi" required><span>Larbi</span></label>
    <label class="opt"><input type="radio" name="choice" value="Emin" required><span>Emin</span></label>
   </fieldset>
-  <button type="submit" class="go" id="go"{% if wait|int > 0 %} disabled{% endif %}>Obtenir mon essai</button>
+  <button type="submit" class="go" id="go"{% if wait|int > 0 or closed %} disabled{% endif %}>Obtenir mon essai</button>
  </form>
  <p class="legal">Pour limiter les abus, votre adresse IP et le type d'appareil utilisé sont enregistrés lors de la génération.</p>
 
- {% if error %}<p class="err" id="err" role="alert">{{ error }}</p>{% endif %}
+ {% if closed %}<p class="closed" role="alert">CONTACTER VOTRE SUPPORT</p>{% endif %}
+
+ {% if error and not closed %}<p class="err" id="err" role="alert">{{ error }}</p>{% endif %}
 
  {% if creds %}
  {% set everything %}{% if creds.server %}Serveur : {{ creds.server }}
@@ -163,6 +167,11 @@ Lien : {{ creds.url }}{% endif %}{% endset %}
  function tick() {
    if (left <= 0) {
      btn.disabled = false; btn.textContent = LABEL;
+     var c = document.getElementById('choices');
+     if (c) {
+       c.hidden = false;
+       c.querySelectorAll('input').forEach(function (i) { i.checked = false; });
+     }
      var e = document.getElementById('err'); if (e) { e.hidden = true; }
      return;
    }
@@ -228,6 +237,17 @@ def notify(choice, ip, ua, creds):
             print("Erreur envoi e-mail :", e)
 
     threading.Thread(target=send, daemon=True).start()
+
+
+def today():
+    return datetime.now(TZ).date() if TZ else date.today()
+
+
+def quota_reached():
+    """True quand les 8 codes du jour ont été générés (à appeler avec _lock)."""
+    if _daily["day"] != today():
+        _daily.update(day=today(), count=0)
+    return _daily["count"] >= MAX_TRIALS_PER_DAY
 
 
 def client_ip():
@@ -347,7 +367,8 @@ def index():
     # --- Consulter la page : n'a JAMAIS d'effet sur le panel ---
     if request.method == "GET":
         with _lock:
-            wait = cooldown_left(ip, now)
+            closed = quota_reached()
+            wait = 0 if closed else cooldown_left(ip, now)
             entry = _results.get(request.args.get("r", ""))
             if entry and entry[2] < now:
                 entry = None
@@ -355,11 +376,11 @@ def index():
             creds, error, _ = entry
         else:
             creds, error = None, (COOLDOWN_MSG if wait else None)
-        return render_template_string(PAGE, creds=creds, error=error, wait=wait)
+        return render_template_string(PAGE, creds=creds, error=error, wait=wait, closed=closed)
 
     # --- Créer un essai : uniquement quand on clique sur le bouton (POST) ---
     if not API_TOKEN:
-        return render_template_string(PAGE, creds=None, error="Service non configuré.", wait=0), 500
+        return render_template_string(PAGE, creds=None, error="Service non configuré.", wait=0, closed=False), 500
 
     choice = request.form.get("choice", "")
     if choice not in CHOICES:
@@ -370,10 +391,8 @@ def index():
         if cooldown_left(ip, now):
             return redirect("/", code=303)
         # 2) plafond global journalier
-        if _daily["day"] != date.today():
-            _daily.update(day=date.today(), count=0)
-        if _daily["count"] >= MAX_TRIALS_PER_DAY:
-            quota_error = "Le quota d'essais du jour est atteint, revenez demain."
+        if quota_reached():
+            return redirect("/", code=303)
         else:
             quota_error = None
             # 3) limite par IP sur 24 h
@@ -384,6 +403,7 @@ def index():
             else:
                 # on enregistre le clic tout de suite (évite les doubles clics simultanés)
                 _last_click[ip] = now
+                _daily["count"] += 1          # place réservée dans les 8 codes du jour
     if quota_error:
         return finish(error=quota_error)
 
@@ -396,9 +416,9 @@ def index():
     with _lock:
         if creds:
             _trials.setdefault(ip, []).append(now)
-            _daily["count"] += 1
         elif error and "Compte créé" not in error:
             _last_click.pop(ip, None)   # échec : on ne pénalise pas le visiteur
+            _daily["count"] = max(0, _daily["count"] - 1)   # et on libère la place réservée
     if creds or (error and "Compte créé" in error):
         notify(choice, ip, request.headers.get("User-Agent", "inconnu"), creds)
     return finish(creds=creds, error=error)
